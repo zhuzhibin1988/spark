@@ -1034,6 +1034,13 @@ class AstBuilder(conf: SQLConf) extends SqlBaseBaseVisitor[AnyRef] with Logging 
   }
 
   /**
+   * Create a [[CreateStruct]] expression.
+   */
+  override def visitStruct(ctx: StructContext): Expression = withOrigin(ctx) {
+    CreateStruct(ctx.argument.asScala.map(expression))
+  }
+
+  /**
    * Create a [[First]] expression.
    */
   override def visitFirst(ctx: FirstContext): Expression = withOrigin(ctx) {
@@ -1056,7 +1063,7 @@ class AstBuilder(conf: SQLConf) extends SqlBaseBaseVisitor[AnyRef] with Logging 
     // Create the function call.
     val name = ctx.qualifiedName.getText
     val isDistinct = Option(ctx.setQuantifier()).exists(_.DISTINCT != null)
-    val arguments = ctx.namedExpression().asScala.map(expression) match {
+    val arguments = ctx.argument.asScala.map(expression) match {
       case Seq(UnresolvedStar(None))
         if name.toLowerCase(Locale.ROOT) == "count" && !isDistinct =>
         // Transform COUNT(*) into COUNT(1).
@@ -1073,19 +1080,6 @@ class AstBuilder(conf: SQLConf) extends SqlBaseBaseVisitor[AnyRef] with Logging 
       case spec: WindowDefContext =>
         WindowExpression(function, visitWindowDef(spec))
       case _ => function
-    }
-  }
-
-  /**
-   * Create a current timestamp/date expression. These are different from regular function because
-   * they do not require the user to specify braces when calling them.
-   */
-  override def visitTimeFunctionCall(ctx: TimeFunctionCallContext): Expression = withOrigin(ctx) {
-    ctx.name.getType match {
-      case SqlBaseParser.CURRENT_DATE =>
-        CurrentDate()
-      case SqlBaseParser.CURRENT_TIMESTAMP =>
-        CurrentTimestamp()
     }
   }
 

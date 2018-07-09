@@ -226,7 +226,7 @@ class ExpressionParserSuite extends PlanTest {
     assertEqual("foo(distinct a, b)", 'foo.distinctFunction('a, 'b))
     assertEqual("grouping(distinct a, b)", 'grouping.distinctFunction('a, 'b))
     assertEqual("`select`(all a, b)", 'select.function('a, 'b))
-    assertEqual("foo(a as x, b as e)", 'foo.function('a as 'x, 'b as 'e))
+    intercept("foo(a x)", "extraneous input 'x'")
   }
 
   test("window function expressions") {
@@ -325,7 +325,9 @@ class ExpressionParserSuite extends PlanTest {
     assertEqual("a.b", UnresolvedAttribute("a.b"))
     assertEqual("`select`.b", UnresolvedAttribute("select.b"))
     assertEqual("(a + b).b", ('a + 'b).getField("b")) // This will fail analysis.
-    assertEqual("struct(a, b).b", 'struct.function('a, 'b).getField("b"))
+    assertEqual(
+      "struct(a, b).b",
+      namedStruct(NamePlaceholder, 'a, NamePlaceholder, 'b).getField("b"))
   }
 
   test("reference") {
@@ -586,11 +588,6 @@ class ExpressionParserSuite extends PlanTest {
     assertEqual("1 + r.r As q", (Literal(1) + UnresolvedAttribute("r.r")).as("q"))
     assertEqual("1 - f('o', o(bar))", Literal(1) - 'f.function("o", 'o.function('bar)))
     intercept("1 - f('o', o(bar)) hello * world", "mismatched input '*'")
-  }
-
-  test("current date/timestamp braceless expressions") {
-    assertEqual("current_date", CurrentDate())
-    assertEqual("current_timestamp", CurrentTimestamp())
   }
 
   test("SPARK-17364, fully qualified column name which starts with number") {

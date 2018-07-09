@@ -29,6 +29,7 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config._
 import org.apache.spark.network.util.ByteUnit
 import org.apache.spark.sql.catalyst.analysis.Resolver
+import org.apache.spark.util.Utils
 import org.apache.spark.util.collection.unsafe.sort.UnsafeExternalSorter
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -268,8 +269,9 @@ object SQLConf {
 
   val PARQUET_OUTPUT_COMMITTER_CLASS = buildConf("spark.sql.parquet.output.committer.class")
     .doc("The output committer class used by Parquet. The specified class needs to be a " +
-      "subclass of org.apache.hadoop.mapreduce.OutputCommitter.  Typically, it's also a subclass " +
-      "of org.apache.parquet.hadoop.ParquetOutputCommitter.")
+      "subclass of org.apache.hadoop.mapreduce.OutputCommitter. Typically, it's also a subclass " +
+      "of org.apache.parquet.hadoop.ParquetOutputCommitter. If it is not, then metadata summaries" +
+      "will never be created, irrespective of the value of parquet.enable.summary-metadata")
     .internal()
     .stringConf
     .createWithDefault("org.apache.parquet.hadoop.ParquetOutputCommitter")
@@ -552,12 +554,6 @@ object SQLConf {
     .booleanConf
     .createWithDefault(true)
 
-  val SUBQUERY_REUSE_ENABLED = buildConf("spark.sql.subquery.reuse")
-    .internal()
-    .doc("When true, the planner will try to find out duplicated subqueries and re-use them.")
-    .booleanConf
-    .createWithDefault(true)
-
   val STATE_STORE_MIN_DELTAS_FOR_SNAPSHOT =
     buildConf("spark.sql.streaming.stateStore.minDeltasForSnapshot")
       .internal()
@@ -780,26 +776,58 @@ object SQLConf {
       .stringConf
       .createWithDefaultFunction(() => TimeZone.getDefault.getID)
 
+  val WINDOW_EXEC_BUFFER_IN_MEMORY_THRESHOLD =
+    buildConf("spark.sql.windowExec.buffer.in.memory.threshold")
+      .internal()
+      .doc("Threshold for number of rows guaranteed to be held in memory by the window operator")
+      .intConf
+      .createWithDefault(4096)
+
   val WINDOW_EXEC_BUFFER_SPILL_THRESHOLD =
     buildConf("spark.sql.windowExec.buffer.spill.threshold")
       .internal()
-      .doc("Threshold for number of rows buffered in window operator")
+      .doc("Threshold for number of rows to be spilled by window operator")
       .intConf
-      .createWithDefault(4096)
+      .createWithDefault(UnsafeExternalSorter.DEFAULT_NUM_ELEMENTS_FOR_SPILL_THRESHOLD.toInt)
+
+  val SORT_MERGE_JOIN_EXEC_BUFFER_IN_MEMORY_THRESHOLD =
+    buildConf("spark.sql.sortMergeJoinExec.buffer.in.memory.threshold")
+      .internal()
+      .doc("Threshold for number of rows guaranteed to be held in memory by the sort merge " +
+        "join operator")
+      .intConf
+      .createWithDefault(Int.MaxValue)
 
   val SORT_MERGE_JOIN_EXEC_BUFFER_SPILL_THRESHOLD =
     buildConf("spark.sql.sortMergeJoinExec.buffer.spill.threshold")
       .internal()
-      .doc("Threshold for number of rows buffered in sort merge join operator")
+      .doc("Threshold for number of rows to be spilled by sort merge join operator")
       .intConf
-      .createWithDefault(Int.MaxValue)
+      .createWithDefault(UnsafeExternalSorter.DEFAULT_NUM_ELEMENTS_FOR_SPILL_THRESHOLD.toInt)
+
+  val CARTESIAN_PRODUCT_EXEC_BUFFER_IN_MEMORY_THRESHOLD =
+    buildConf("spark.sql.cartesianProductExec.buffer.in.memory.threshold")
+      .internal()
+      .doc("Threshold for number of rows guaranteed to be held in memory by the cartesian " +
+        "product operator")
+      .intConf
+      .createWithDefault(4096)
 
   val CARTESIAN_PRODUCT_EXEC_BUFFER_SPILL_THRESHOLD =
     buildConf("spark.sql.cartesianProductExec.buffer.spill.threshold")
       .internal()
-      .doc("Threshold for number of rows buffered in cartesian product operator")
+      .doc("Threshold for number of rows to be spilled by cartesian product operator")
       .intConf
       .createWithDefault(UnsafeExternalSorter.DEFAULT_NUM_ELEMENTS_FOR_SPILL_THRESHOLD.toInt)
+
+  val SQL_OPTIONS_REDACTION_PATTERN =
+    buildConf("spark.sql.redaction.options.regex")
+      .doc("Regex to decide which keys in a Spark SQL command's options map contain sensitive " +
+        "information. The values of options whose names that match this regex will be redacted " +
+        "in the explain output. This redaction is applied on top of the global redaction " +
+        s"configuration defined by ${SECRET_REDACTION_PATTERN.key}.")
+    .regexConf
+    .createWithDefault("(?i)url".r)
 
   object Deprecated {
     val MAPRED_REDUCE_TASKS = "mapred.reduce.tasks"
@@ -927,8 +955,6 @@ class SQLConf extends Serializable with Logging {
 
   def exchangeReuseEnabled: Boolean = getConf(EXCHANGE_REUSE_ENABLED)
 
-  def subqueryReuseEnabled: Boolean = getConf(SUBQUERY_REUSE_ENABLED)
-
   def caseSensitiveAnalysis: Boolean = getConf(SQLConf.CASE_SENSITIVE)
 
   def constraintPropagationEnabled: Boolean = getConf(CONSTRAINT_PROPAGATION_ENABLED)
@@ -1045,10 +1071,18 @@ class SQLConf extends Serializable with Logging {
 
   def joinReorderDPStarFilter: Boolean = getConf(SQLConf.JOIN_REORDER_DP_STAR_FILTER)
 
+  def windowExecBufferInMemoryThreshold: Int = getConf(WINDOW_EXEC_BUFFER_IN_MEMORY_THRESHOLD)
+
   def windowExecBufferSpillThreshold: Int = getConf(WINDOW_EXEC_BUFFER_SPILL_THRESHOLD)
+
+  def sortMergeJoinExecBufferInMemoryThreshold: Int =
+    getConf(SORT_MERGE_JOIN_EXEC_BUFFER_IN_MEMORY_THRESHOLD)
 
   def sortMergeJoinExecBufferSpillThreshold: Int =
     getConf(SORT_MERGE_JOIN_EXEC_BUFFER_SPILL_THRESHOLD)
+
+  def cartesianProductExecBufferInMemoryThreshold: Int =
+    getConf(CARTESIAN_PRODUCT_EXEC_BUFFER_IN_MEMORY_THRESHOLD)
 
   def cartesianProductExecBufferSpillThreshold: Int =
     getConf(CARTESIAN_PRODUCT_EXEC_BUFFER_SPILL_THRESHOLD)
@@ -1130,10 +1164,12 @@ class SQLConf extends Serializable with Logging {
    * not set yet, return `defaultValue`.
    */
   def getConfString(key: String, defaultValue: String): String = {
-    val entry = sqlConfEntries.get(key)
-    if (entry != null && defaultValue != "<undefined>") {
-      // Only verify configs in the SQLConf object
-      entry.valueConverter(defaultValue)
+    if (defaultValue != null && defaultValue != "<undefined>") {
+      val entry = sqlConfEntries.get(key)
+      if (entry != null) {
+        // Only verify configs in the SQLConf object
+        entry.valueConverter(defaultValue)
+      }
     }
     Option(settings.get(key)).getOrElse(defaultValue)
   }
@@ -1153,6 +1189,17 @@ class SQLConf extends Serializable with Logging {
     sqlConfEntries.values.asScala.filter(_.isPublic).map { entry =>
       (entry.key, getConfString(entry.key, entry.defaultValueString), entry.doc)
     }.toSeq
+  }
+
+  /**
+   * Redacts the given option map according to the description of SQL_OPTIONS_REDACTION_PATTERN.
+   */
+  def redactOptions(options: Map[String, String]): Map[String, String] = {
+    val regexes = Seq(
+      getConf(SQL_OPTIONS_REDACTION_PATTERN),
+      SECRET_REDACTION_PATTERN.readFrom(reader))
+
+    regexes.foldLeft(options.toSeq) { case (opts, r) => Utils.redact(Some(r), opts) }.toMap
   }
 
   /**

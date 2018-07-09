@@ -435,8 +435,8 @@ class DataFrame(object):
         [Row(age=2, name=u'Alice'), Row(age=5, name=u'Bob')]
         """
         with SCCallSiteSync(self._sc) as css:
-            port = self._jdf.collectToPython()
-        return list(_load_from_socket(port, BatchedSerializer(PickleSerializer())))
+            sock_info = self._jdf.collectToPython()
+        return list(_load_from_socket(sock_info, BatchedSerializer(PickleSerializer())))
 
     @ignore_unicode_prefix
     @since(2.0)
@@ -449,8 +449,8 @@ class DataFrame(object):
         [Row(age=2, name=u'Alice'), Row(age=5, name=u'Bob')]
         """
         with SCCallSiteSync(self._sc) as css:
-            port = self._jdf.toPythonIterator()
-        return _load_from_socket(port, BatchedSerializer(PickleSerializer()))
+            sock_info = self._jdf.toPythonIterator()
+        return _load_from_socket(sock_info, BatchedSerializer(PickleSerializer()))
 
     @ignore_unicode_prefix
     @since(1.3)
@@ -1166,18 +1166,23 @@ class DataFrame(object):
 
     @since(2.0)
     def union(self, other):
-        """ Return a new :class:`DataFrame` containing union of rows in this
-        frame and another frame.
+        """ Return a new :class:`DataFrame` containing union of rows in this and another frame.
 
         This is equivalent to `UNION ALL` in SQL. To do a SQL-style set union
         (that does deduplication of elements), use this function followed by a distinct.
+
+        Also as standard in SQL, this function resolves columns by position (not by name).
         """
         return DataFrame(self._jdf.union(other._jdf), self.sql_ctx)
 
     @since(1.3)
     def unionAll(self, other):
-        """ Return a new :class:`DataFrame` containing union of rows in this
-        frame and another frame.
+        """ Return a new :class:`DataFrame` containing union of rows in this and another frame.
+
+        This is equivalent to `UNION ALL` in SQL. To do a SQL-style set union
+        (that does deduplication of elements), use this function followed by a distinct.
+
+        Also as standard in SQL, this function resolves columns by position (not by name).
 
         .. note:: Deprecated in 2.0, use union instead.
         """

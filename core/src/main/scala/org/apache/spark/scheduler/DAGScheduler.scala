@@ -38,7 +38,7 @@ import org.apache.spark.executor.TaskMetrics
 import org.apache.spark.internal.Logging
 import org.apache.spark.network.util.JavaUtils
 import org.apache.spark.partial.{ApproximateActionListener, ApproximateEvaluator, PartialResult}
-import org.apache.spark.rdd.RDD
+import org.apache.spark.rdd.{RDD, RDDCheckpointData}
 import org.apache.spark.rpc.RpcTimeout
 import org.apache.spark.storage._
 import org.apache.spark.storage.BlockManagerMessages.BlockManagerHeartbeat
@@ -992,15 +992,24 @@ class DAGScheduler(
     // might modify state of objects referenced in their closures. This is necessary in Hadoop
     // where the JobConf/Configuration object is not thread-safe.
     var taskBinary: Broadcast[Array[Byte]] = null
+    var partitions: Array[Partition] = null
     try {
       // For ShuffleMapTask, serialize and broadcast (rdd, shuffleDep).
       // For ResultTask, serialize and broadcast (rdd, func).
-      val taskBinaryBytes: Array[Byte] = stage match {
-        case stage: ShuffleMapStage =>
-          JavaUtils.bufferToArray(
-            closureSerializer.serialize((stage.rdd, stage.shuffleDep): AnyRef))
-        case stage: ResultStage =>
-          JavaUtils.bufferToArray(closureSerializer.serialize((stage.rdd, stage.func): AnyRef))
+      var taskBinaryBytes: Array[Byte] = null
+      // taskBinaryBytes and partitions are both effected by the checkpoint status. We need
+      // this synchronization in case another concurrent job is checkpointing this RDD, so we get a
+      // consistent view of both variables.
+      RDDCheckpointData.synchronized {
+        taskBinaryBytes = stage match {
+          case stage: ShuffleMapStage =>
+            JavaUtils.bufferToArray(
+              closureSerializer.serialize((stage.rdd, stage.shuffleDep): AnyRef))
+          case stage: ResultStage =>
+            JavaUtils.bufferToArray(closureSerializer.serialize((stage.rdd, stage.func): AnyRef))
+        }
+
+        partitions = stage.rdd.partitions
       }
 
       taskBinary = sc.broadcast(taskBinaryBytes)
@@ -1025,7 +1034,7 @@ class DAGScheduler(
           stage.pendingPartitions.clear()
           partitionsToCompute.map { id =>
             val locs = taskIdToLocations(id)
-            val part = stage.rdd.partitions(id)
+            val part = partitions(id)
             stage.pendingPartitions += id
             new ShuffleMapTask(stage.id, stage.latestInfo.attemptId,
               taskBinary, part, locs, properties, serializedTaskMetrics, Option(jobId),
@@ -1035,7 +1044,7 @@ class DAGScheduler(
         case stage: ResultStage =>
           partitionsToCompute.map { id =>
             val p: Int = stage.partitions(id)
-            val part = stage.rdd.partitions(p)
+            val part = partitions(p)
             val locs = taskIdToLocations(id)
             new ResultTask(stage.id, stage.latestInfo.attemptId,
               taskBinary, part, locs, id, properties, serializedTaskMetrics,
@@ -1111,6 +1120,25 @@ class DAGScheduler(
     }
   }
 
+  private def postTaskEnd(event: CompletionEvent): Unit = {
+    val taskMetrics: TaskMetrics =
+      if (event.accumUpdates.nonEmpty) {
+        try {
+          TaskMetrics.fromAccumulators(event.accumUpdates)
+        } catch {
+          case NonFatal(e) =>
+            val taskId = event.taskInfo.taskId
+            logError(s"Error when attempting to reconstruct metrics for task $taskId", e)
+            null
+        }
+      } else {
+        null
+      }
+
+    listenerBus.post(SparkListenerTaskEnd(event.task.stageId, event.task.stageAttemptId,
+      Utils.getFormattedClassName(event.task), event.reason, event.taskInfo, taskMetrics))
+  }
+
   /**
    * Responds to a task finishing. This is called inside the event loop so it assumes that it can
    * modify the scheduler's internal state. Use taskEnded() to post a task end event from outside.
@@ -1123,38 +1151,41 @@ class DAGScheduler(
 
     outputCommitCoordinator.taskCompleted(
       stageId,
+      task.stageAttemptId,
       task.partitionId,
       event.taskInfo.attemptNumber, // this is a task attempt number
       event.reason)
 
-    // Reconstruct task metrics. Note: this may be null if the task has failed.
-    val taskMetrics: TaskMetrics =
-      if (event.accumUpdates.nonEmpty) {
-        try {
-          TaskMetrics.fromAccumulators(event.accumUpdates)
-        } catch {
-          case NonFatal(e) =>
-            logError(s"Error when attempting to reconstruct metrics for task $taskId", e)
-            null
-        }
-      } else {
-        null
-      }
-
-    // The stage may have already finished when we get this event -- eg. maybe it was a
-    // speculative task. It is important that we send the TaskEnd event in any case, so listeners
-    // are properly notified and can chose to handle it. For instance, some listeners are
-    // doing their own accounting and if they don't get the task end event they think
-    // tasks are still running when they really aren't.
-    listenerBus.post(SparkListenerTaskEnd(
-       stageId, task.stageAttemptId, taskType, event.reason, event.taskInfo, taskMetrics))
-
     if (!stageIdToStage.contains(task.stageId)) {
+      // The stage may have already finished when we get this event -- eg. maybe it was a
+      // speculative task. It is important that we send the TaskEnd event in any case, so listeners
+      // are properly notified and can chose to handle it. For instance, some listeners are
+      // doing their own accounting and if they don't get the task end event they think
+      // tasks are still running when they really aren't.
+      postTaskEnd(event)
+
       // Skip all the actions if the stage has been cancelled.
       return
     }
 
     val stage = stageIdToStage(task.stageId)
+
+    // Make sure the task's accumulators are updated before any other processing happens, so that
+    // we can post a task end event before any jobs or stages are updated. The accumulators are
+    // only updated in certain cases.
+    event.reason match {
+      case Success =>
+        stage match {
+          case rs: ResultStage if rs.activeJob.isEmpty =>
+            // Ignore update if task's job has finished.
+          case _ =>
+            updateAccumulators(event)
+        }
+      case _: ExceptionFailure => updateAccumulators(event)
+      case _ =>
+    }
+    postTaskEnd(event)
+
     event.reason match {
       case Success =>
         task match {
@@ -1165,7 +1196,6 @@ class DAGScheduler(
             resultStage.activeJob match {
               case Some(job) =>
                 if (!job.finished(rt.outputId)) {
-                  updateAccumulators(event)
                   job.finished(rt.outputId) = true
                   job.numFinished += 1
                   // If the whole job has finished, remove it
@@ -1192,7 +1222,6 @@ class DAGScheduler(
 
           case smt: ShuffleMapTask =>
             val shuffleStage = stage.asInstanceOf[ShuffleMapStage]
-            updateAccumulators(event)
             val status = event.result.asInstanceOf[MapStatus]
             val execId = status.location.executorId
             logDebug("ShuffleMapTask finished on " + execId)
@@ -1281,22 +1310,23 @@ class DAGScheduler(
             s" ${task.stageAttemptId} and there is a more recent attempt for that stage " +
             s"(attempt ID ${failedStage.latestInfo.attemptId}) running")
         } else {
+          failedStage.fetchFailedAttemptIds.add(task.stageAttemptId)
+          val shouldAbortStage =
+            failedStage.fetchFailedAttemptIds.size >= maxConsecutiveStageAttempts ||
+            disallowStageRetryForTest
+
           // It is likely that we receive multiple FetchFailed for a single stage (because we have
           // multiple tasks running concurrently on different executors). In that case, it is
           // possible the fetch failure has already been handled by the scheduler.
           if (runningStages.contains(failedStage)) {
             logInfo(s"Marking $failedStage (${failedStage.name}) as failed " +
               s"due to a fetch failure from $mapStage (${mapStage.name})")
-            markStageAsFinished(failedStage, Some(failureMessage))
+            markStageAsFinished(failedStage, errorMessage = Some(failureMessage),
+              willRetry = !shouldAbortStage)
           } else {
             logDebug(s"Received fetch failure from $task, but its from $failedStage which is no " +
               s"longer running")
           }
-
-          failedStage.fetchFailedAttemptIds.add(task.stageAttemptId)
-          val shouldAbortStage =
-            failedStage.fetchFailedAttemptIds.size >= maxConsecutiveStageAttempts ||
-            disallowStageRetryForTest
 
           if (shouldAbortStage) {
             val abortMessage = if (disallowStageRetryForTest) {
@@ -1351,8 +1381,7 @@ class DAGScheduler(
         // Do nothing here, left up to the TaskScheduler to decide how to handle denied commits
 
       case exceptionFailure: ExceptionFailure =>
-        // Tasks failed with exceptions might still have accumulator updates.
-        updateAccumulators(event)
+        // Nothing left to do, already handled above for accumulator updates.
 
       case TaskResultLost =>
         // Do nothing here; the TaskScheduler handles these failures and resubmits the task.
@@ -1444,7 +1473,10 @@ class DAGScheduler(
   /**
    * Marks a stage as finished and removes it from the list of running stages.
    */
-  private def markStageAsFinished(stage: Stage, errorMessage: Option[String] = None): Unit = {
+  private def markStageAsFinished(
+      stage: Stage,
+      errorMessage: Option[String] = None,
+      willRetry: Boolean = false): Unit = {
     val serviceTime = stage.latestInfo.submissionTime match {
       case Some(t) => "%.03f".format((clock.getTimeMillis() - t) / 1000.0)
       case _ => "Unknown"
@@ -1463,7 +1495,9 @@ class DAGScheduler(
       logInfo(s"$stage (${stage.name}) failed in $serviceTime s due to ${errorMessage.get}")
     }
 
-    outputCommitCoordinator.stageEnd(stage.id)
+    if (!willRetry) {
+      outputCommitCoordinator.stageEnd(stage.id)
+    }
     listenerBus.post(SparkListenerStageCompleted(stage.latestInfo))
     runningStages -= stage
   }

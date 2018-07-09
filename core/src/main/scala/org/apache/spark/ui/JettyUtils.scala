@@ -26,6 +26,8 @@ import scala.language.implicitConversions
 import scala.xml.Node
 
 import org.eclipse.jetty.client.api.Response
+import org.eclipse.jetty.client.HttpClient
+import org.eclipse.jetty.client.http.HttpClientTransportOverHTTP
 import org.eclipse.jetty.proxy.ProxyServlet
 import org.eclipse.jetty.server._
 import org.eclipse.jetty.server.handler._
@@ -208,6 +210,16 @@ private[spark] object JettyUtils extends Logging {
         rewrittenURI.toString()
       }
 
+      override def newHttpClient(): HttpClient = {
+        // SPARK-21176: Use the Jetty logic to calculate the number of selector threads (#CPUs/2),
+        // but limit it to 8 max.
+        // Otherwise, it might happen that we exhaust the threadpool since in reverse proxy mode
+        // a proxy is instantiated for each executor. If the head node has many processors, this
+        // can quickly add up to an unreasonably high number of threads.
+        val numSelectors = math.max(1, math.min(8, Runtime.getRuntime().availableProcessors() / 2))
+        new HttpClient(new HttpClientTransportOverHTTP(numSelectors), null)
+      }
+
       override def filterServerResponseHeader(
           clientRequest: HttpServletRequest,
           serverResponse: Response,
@@ -238,7 +250,7 @@ private[spark] object JettyUtils extends Logging {
     filters.foreach {
       case filter : String =>
         if (!filter.isEmpty) {
-          logInfo("Adding filter: " + filter)
+          logInfo(s"Adding filter $filter to ${handlers.map(_.getContextPath).mkString(", ")}.")
           val holder : FilterHolder = new FilterHolder()
           holder.setClassName(filter)
           // Get any parameters for each filter
@@ -318,12 +330,13 @@ private[spark] object JettyUtils extends Logging {
           -1,
           connectionFactories: _*)
         connector.setPort(port)
-        connector.start()
+        connector.setHost(hostName)
 
         // Currently we only use "SelectChannelConnector"
         // Limit the max acceptor number to 8 so that we don't waste a lot of threads
         connector.setAcceptQueueSize(math.min(connector.getAcceptors, 8))
-        connector.setHost(hostName)
+
+        connector.start()
         // The number of selectors always equals to the number of acceptors
         minThreads += connector.getAcceptors * 2
 
@@ -380,7 +393,7 @@ private[spark] object JettyUtils extends Logging {
       }
 
       pool.setMaxThreads(math.max(pool.getMaxThreads, minThreads))
-      ServerInfo(server, httpPort, securePort, collection)
+      ServerInfo(server, httpPort, securePort, conf, collection)
     } catch {
       case e: Exception =>
         server.stop()
@@ -479,10 +492,12 @@ private[spark] case class ServerInfo(
     server: Server,
     boundPort: Int,
     securePort: Option[Int],
+    conf: SparkConf,
     private val rootHandler: ContextHandlerCollection) {
 
-  def addHandler(handler: ContextHandler): Unit = {
+  def addHandler(handler: ServletContextHandler): Unit = {
     handler.setVirtualHosts(JettyUtils.toVirtualHosts(JettyUtils.SPARK_CONNECTOR_NAME))
+    JettyUtils.addFilters(Seq(handler), conf)
     rootHandler.addHandler(handler)
     if (!handler.isStarted()) {
       handler.start()

@@ -758,7 +758,7 @@ abstract class DDLSuite extends QueryTest with SQLTestUtils {
     val df = (1 to 2).map { i => (i, i.toString) }.toDF("age", "name")
     df.write.insertInto("students")
     spark.catalog.cacheTable("students")
-    assume(spark.table("students").collect().toSeq == df.collect().toSeq, "bad test: wrong data")
+    checkAnswer(spark.table("students"), df)
     assume(spark.catalog.isCached("students"), "bad test: table was not cached in the first place")
     sql("ALTER TABLE students RENAME TO teachers")
     sql("CREATE TABLE students (age INT, name STRING) USING parquet")
@@ -767,7 +767,7 @@ abstract class DDLSuite extends QueryTest with SQLTestUtils {
     assert(!spark.catalog.isCached("students"))
     assert(spark.catalog.isCached("teachers"))
     assert(spark.table("students").collect().isEmpty)
-    assert(spark.table("teachers").collect().toSeq == df.collect().toSeq)
+    checkAnswer(spark.table("teachers"), df)
   }
 
   test("rename temporary table - destination table with database name") {
@@ -800,10 +800,11 @@ abstract class DDLSuite extends QueryTest with SQLTestUtils {
       spark.range(10).createOrReplaceTempView("tab1")
       sql("ALTER TABLE tab1 RENAME TO tab2")
       checkAnswer(spark.table("tab2"), spark.range(10).toDF())
-      intercept[NoSuchTableException] { spark.table("tab1") }
+      val e = intercept[AnalysisException](spark.table("tab1")).getMessage
+      assert(e.contains("Table or view not found"))
       sql("ALTER VIEW tab2 RENAME TO tab1")
       checkAnswer(spark.table("tab1"), spark.range(10).toDF())
-      intercept[NoSuchTableException] { spark.table("tab2") }
+      intercept[AnalysisException] { spark.table("tab2") }
     }
   }
 
@@ -1434,6 +1435,7 @@ abstract class DDLSuite extends QueryTest with SQLTestUtils {
     // Ensure that change column will preserve other metadata fields.
     sql("ALTER TABLE dbx.tab1 CHANGE COLUMN col1 col1 INT COMMENT 'this is col1'")
     assert(getMetadata("col1").getString("key") == "value")
+    assert(getMetadata("col1").getString("comment") == "this is col1")
   }
 
   test("drop build-in function") {
@@ -2281,18 +2283,9 @@ abstract class DDLSuite extends QueryTest with SQLTestUtils {
             }.getMessage
             assert(e.contains("Found duplicate column(s)"))
           } else {
-            if (isUsingHiveMetastore) {
-              // hive catalog will still complains that c1 is duplicate column name because hive
-              // identifiers are case insensitive.
-              val e = intercept[AnalysisException] {
-                sql("ALTER TABLE t1 ADD COLUMNS (C1 string)")
-              }.getMessage
-              assert(e.contains("HiveException"))
-            } else {
-              sql("ALTER TABLE t1 ADD COLUMNS (C1 string)")
-              assert(spark.table("t1").schema
-                .equals(new StructType().add("c1", IntegerType).add("C1", StringType)))
-            }
+            sql("ALTER TABLE t1 ADD COLUMNS (C1 string)")
+            assert(spark.table("t1").schema ==
+              new StructType().add("c1", IntegerType).add("C1", StringType))
           }
         }
       }

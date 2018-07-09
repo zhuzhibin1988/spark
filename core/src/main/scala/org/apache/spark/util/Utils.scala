@@ -18,6 +18,7 @@
 package org.apache.spark.util
 
 import java.io._
+import java.lang.{Byte => JByte}
 import java.lang.management.{LockInfo, ManagementFactory, MonitorInfo, ThreadInfo}
 import java.math.{MathContext, RoundingMode}
 import java.net._
@@ -25,6 +26,7 @@ import java.nio.ByteBuffer
 import java.nio.channels.{Channels, FileChannel}
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Paths}
+import java.security.SecureRandom
 import java.util.{Locale, Properties, Random, UUID}
 import java.util.concurrent._
 import java.util.concurrent.atomic.AtomicBoolean
@@ -43,6 +45,7 @@ import scala.util.matching.Regex
 
 import _root_.io.netty.channel.unix.Errors.NativeIoException
 import com.google.common.cache.{CacheBuilder, CacheLoader, LoadingCache}
+import com.google.common.hash.HashCodes
 import com.google.common.io.{ByteStreams, Files => GFiles}
 import com.google.common.net.InetAddresses
 import org.apache.commons.lang3.SystemUtils
@@ -1345,14 +1348,10 @@ private[spark] object Utils extends Logging {
       try {
         finallyBlock
       } catch {
-        case t: Throwable =>
-          if (originalThrowable != null) {
-            originalThrowable.addSuppressed(t)
-            logWarning(s"Suppressing exception in finally: " + t.getMessage, t)
-            throw originalThrowable
-          } else {
-            throw t
-          }
+        case t: Throwable if (originalThrowable != null && originalThrowable != t) =>
+          originalThrowable.addSuppressed(t)
+          logWarning(s"Suppressing exception in finally: ${t.getMessage}", t)
+          throw originalThrowable
       }
     }
   }
@@ -1384,22 +1383,20 @@ private[spark] object Utils extends Logging {
           catchBlock
         } catch {
           case t: Throwable =>
-            originalThrowable.addSuppressed(t)
-            logWarning(s"Suppressing exception in catch: " + t.getMessage, t)
+            if (originalThrowable != t) {
+              originalThrowable.addSuppressed(t)
+              logWarning(s"Suppressing exception in catch: ${t.getMessage}", t)
+            }
         }
         throw originalThrowable
     } finally {
       try {
         finallyBlock
       } catch {
-        case t: Throwable =>
-          if (originalThrowable != null) {
-            originalThrowable.addSuppressed(t)
-            logWarning(s"Suppressing exception in finally: " + t.getMessage, t)
-            throw originalThrowable
-          } else {
-            throw t
-          }
+        case t: Throwable if (originalThrowable != null && originalThrowable != t) =>
+          originalThrowable.addSuppressed(t)
+          logWarning(s"Suppressing exception in finally: ${t.getMessage}", t)
+          throw originalThrowable
       }
     }
   }
@@ -2586,18 +2583,23 @@ private[spark] object Utils extends Logging {
   }
 
   /**
-   * In YARN mode this method returns a union of the jar files pointed by "spark.jars" and the
-   * "spark.yarn.dist.jars" properties, while in other modes it returns the jar files pointed by
-   * only the "spark.jars" property.
+   * Return the jar files pointed by the "spark.jars" property. Spark internally will distribute
+   * these jars through file server. In the YARN mode, it will return an empty list, since YARN
+   * has its own mechanism to distribute jars.
    */
-  def getUserJars(conf: SparkConf, isShell: Boolean = false): Seq[String] = {
+  def getUserJars(conf: SparkConf): Seq[String] = {
     val sparkJars = conf.getOption("spark.jars")
-    if (conf.get("spark.master") == "yarn" && isShell) {
-      val yarnJars = conf.getOption("spark.yarn.dist.jars")
-      unionFileLists(sparkJars, yarnJars).toSeq
-    } else {
-      sparkJars.map(_.split(",")).map(_.filter(_.nonEmpty)).toSeq.flatten
-    }
+    sparkJars.map(_.split(",")).map(_.filter(_.nonEmpty)).toSeq.flatten
+  }
+
+  /**
+   * Return the local jar files which will be added to REPL's classpath. These jar files are
+   * specified by --jars (spark.jars) or --packages, remote jars will be downloaded to local by
+   * SparkSubmit at first.
+   */
+  def getLocalUserJarsForShell(conf: SparkConf): Seq[String] = {
+    val localJars = conf.getOption("spark.repl.local.jars")
+    localJars.map(_.split(",")).map(_.filter(_.nonEmpty)).toSeq.flatten
   }
 
   private[spark] val REDACTION_REPLACEMENT_TEXT = "*********(redacted)"
@@ -2615,9 +2617,23 @@ private[spark] object Utils extends Logging {
    * Redact the sensitive information in the given string.
    */
   def redact(conf: SparkConf, text: String): String = {
-    if (text == null || text.isEmpty || !conf.contains(STRING_REDACTION_PATTERN)) return text
-    val regex = conf.get(STRING_REDACTION_PATTERN).get
-    regex.replaceAllIn(text, REDACTION_REPLACEMENT_TEXT)
+    if (text == null || text.isEmpty || conf == null || !conf.contains(STRING_REDACTION_PATTERN)) {
+      text
+    } else {
+      val regex = conf.get(STRING_REDACTION_PATTERN).get
+      regex.replaceAllIn(text, REDACTION_REPLACEMENT_TEXT)
+    }
+  }
+
+  /**
+   * Redact the sensitive values in the given map. If a map key matches the redaction pattern then
+   * its value is replaced with a dummy text.
+   */
+  def redact(regex: Option[Regex], kvs: Seq[(String, String)]): Seq[(String, String)] = {
+    regex match {
+      case None => kvs
+      case Some(r) => redact(r, kvs)
+    }
   }
 
   private def redact(redactionPattern: Regex, kvs: Seq[(String, String)]): Seq[(String, String)] = {
@@ -2654,6 +2670,14 @@ private[spark] object Utils extends Logging {
       SECRET_REDACTION_PATTERN.defaultValueString
     ).r
     redact(redactionPattern, kvs.toArray)
+  }
+
+  def createSecret(conf: SparkConf): String = {
+    val bits = conf.get(AUTH_SECRET_BIT_LENGTH)
+    val rnd = new SecureRandom()
+    val secretBytes = new Array[Byte](bits / JByte.SIZE)
+    rnd.nextBytes(secretBytes)
+    HashCodes.fromBytes(secretBytes).toString()
   }
 
 }
